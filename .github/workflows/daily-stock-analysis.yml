@@ -64,6 +64,15 @@ jobs:
           curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
           echo "$HOME/.kimi-code/bin" >> "$GITHUB_PATH"
 
+      # CIランナーの外部通信をすべて VPN Gate の日本リレー経由にする。
+      # 株探(kabutan.jp)はデータセンターIPをWAFで拒否(HTTP 405)するため、
+      # 日本のISP/家庭用IPから egress されるリレー経由でブロックを回避する。
+      # 注意: このステップ以降、Notion/Kimi の API 通信を含む外部通信はすべて
+      # リレーを通る。リレーがダウンしている場合はスコア順に最大10台まで試行し、
+      # すべて失敗したらジョブを失敗させる。
+      - name: Route all traffic via VPN Gate Japan relay
+        run: sudo bash ci/setup-vpn-gate.sh
+
       # analyze-only モードではスクリーナーをスキップし、リポジトリに登録済みの
       # テスト用フィクスチャCSV (test/fixtures/pullback_buy_signals.csv) を使って analyze を検証する
       - name: Run stock-screener
