@@ -23,6 +23,8 @@ env:
 jobs:
   screen-and-analyze:
     runs-on: ubuntu-latest
+    # Secrets/Variables は "Github Actions" Environment に登録されているため参照必須
+    environment: Github Actions
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
