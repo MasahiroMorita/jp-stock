@@ -157,6 +157,12 @@ def fetch_stock_and_market_data(ticker_code: str):
 KABUTAN_BASE_URL = "https://kabutan.jp"
 KABUTAN_KESSAN_LIMIT = 3  # 取得する決算速報の最大件数
 KABUTAN_INDUSTRY_RANKING_PAGES = (1, 2, 3)  # 業種別ランキングのページ（全33業種分）
+# 業種別ランキングのキャッシュファイル。取得結果は日付付きで保存し、同日の再実行では
+# Web取得をせずキャッシュを使い回す（ analyze_signals.py が本スクリプトを銘柄数分起動するため、
+# CI上で株探へ大量リクエストが集中して405エラーになる問題への対策）。
+KABUTAN_INDUSTRY_RANKING_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kabutan_industry_ranking.json"
+)
 
 
 def fetch_kabutan_kessan_news(ticker_code: str, limit: int = KABUTAN_KESSAN_LIMIT) -> list[dict]:
@@ -218,12 +224,43 @@ def _parse_num(text: str) -> float | None:
     return value
 
 
+def _load_kabutan_industry_ranking_cache() -> dict | None:
+    """業種別ランキングのキャッシュファイルを読み込む。存在しない・破損している場合は None。"""
+    try:
+        with open(KABUTAN_INDUSTRY_RANKING_CACHE_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("industries"), list):
+        return None
+    return payload
+
+
+def _save_kabutan_industry_ranking_cache(fetched_date: str, industries: list[dict]) -> None:
+    """業種別ランキングを日付付きでキャッシュファイルに保存する。保存失敗時は警告のみ出して継続する。"""
+    try:
+        with open(KABUTAN_INDUSTRY_RANKING_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fetched_date": fetched_date, "industries": industries}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"⚠️ 業種別ランキングのキャッシュ保存に失敗しました（スキップします）: {e}")
+
+
 def fetch_kabutan_industry_ranking(pages: tuple = KABUTAN_INDUSTRY_RANKING_PAGES) -> list[dict]:
     """
     株探の「業種別ランキング」(mode=9_1)を `pages` ページ分取得し、
     table.stock_table から各業種の平均株価・前日比（増減）・PER・PBR・利回りを抽出する。
     ページ取得に失敗した場合は警告を出してそのページをスキップする（分析自体は継続する）。
+
+    取得結果は日付付きでキャッシュファイルに保存し、同日中の再実行ではWeb取得せずキャッシュを
+    使い回す。Web取得に失敗した場合は、日付が異なる（古い）キャッシュでもフォールバックとして使う。
     """
+    today = date.today().isoformat()
+    cache = _load_kabutan_industry_ranking_cache()
+    if cache is not None and cache.get("fetched_date") == today:
+        industries = cache["industries"]
+        print(f"💾 業種別ランキングはキャッシュファイルから読み込みました（{today} 取得分・全{len(industries)}業種）")
+        return industries
+
     industries = []
     for page in pages:
         url = f"{KABUTAN_BASE_URL}/warning/?mode=9_1&page={page}"
@@ -252,7 +289,15 @@ def fetch_kabutan_industry_ranking(pages: tuple = KABUTAN_INDUSTRY_RANKING_PAGES
             })
         time.sleep(1)  # 株探への負荷軽減のための待機
 
-    return industries
+    if industries:
+        _save_kabutan_industry_ranking_cache(today, industries)
+        return industries
+
+    if cache is not None:
+        industries = cache["industries"]
+        print(f"⚠️ 業種別ランキングの取得に失敗したため、キャッシュ（{cache.get('fetched_date', '日付不明')} 取得分・全{len(industries)}業種）を使用します。")
+        return industries
+    return []
 
 
 def fetch_kabutan_next_earnings_date(ticker_code: str) -> dict | None:
