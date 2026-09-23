@@ -54,7 +54,8 @@ jobs:
       - name: Run stock-analyze (STRONG_BUY / BUY)
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # データベースIDは資格情報ではないため Variable で管理
+          NOTION_DATABASE_ID: ${{ vars.NOTION_DATABASE_ID }}
           # Kimi Platform の API キー認証（config.toml 不要の env ベース認証）
           KIMI_MODEL_NAME: ${{ vars.KIMI_MODEL_NAME }}
           KIMI_MODEL_API_KEY: ${{ secrets.KIMI_API_KEY }}
