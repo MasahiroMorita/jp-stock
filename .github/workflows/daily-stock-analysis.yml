@@ -29,6 +29,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 株探 業種別ランキングのキャッシュを前回実行分から復元する。
+      # ファイル内の日付が当日ならそのまま使い回し、前日分でも株探からの
+      # 取得失敗(405)時のフォールバックとして使われる（actions/cache がジョブ終了時に自動保存）。
+      - name: Cache kabutan industry ranking
+        uses: actions/cache@v4
+        with:
+          path: kabutan_industry_ranking.json
+          key: kabutan-industry-ranking-${{ github.run_id }}
+          restore-keys: kabutan-industry-ranking-
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}

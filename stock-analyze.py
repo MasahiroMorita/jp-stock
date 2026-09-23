@@ -31,6 +31,21 @@ AI_EVAL_SKIP_THRESHOLD = 22
 
 
 # --- Step 1: データ収集（銘柄データ ＋ 市場全体地合いデータ） ---
+_YF_SESSION = None
+
+
+def _get_yf_session():
+    """
+    Yahoo Finance 用のブラウザ偽装セッションを返す（全銘柄・地合いデータで使い回す）。
+    CI等のデータセンターIPでは TLS フィンガープリントの違いから 429/401 の
+    Bot 判定を受けやすく、curl_cffi の chrome 偽装セッションで回避できる場合がある。
+    """
+    global _YF_SESSION
+    if _YF_SESSION is None:
+        _YF_SESSION = cffi_requests.Session(impersonate="chrome")
+    return _YF_SESSION
+
+
 def _fetch_info_with_retry(stock, max_retries: int = 5) -> dict:
     """
     stock.info を取得する。Yahoo Finance のレートリミット(429)には
@@ -39,7 +54,10 @@ def _fetch_info_with_retry(stock, max_retries: int = 5) -> dict:
     delay = 20
     for attempt in range(1, max_retries + 1):
         try:
-            return stock.info
+            info = stock.info
+            if not info.get("shortName") and not (info.get("currentPrice") or info.get("previousClose")):
+                print("⚠️ Yahoo Finance から基本情報を取得できていない可能性があります（定量スコアを疑ってください）。")
+            return info
         except YFRateLimitError:
             if attempt == max_retries:
                 raise
@@ -76,7 +94,7 @@ def fetch_stock_technicals(ticker_code: str) -> dict:
     データ取得に失敗した場合は警告を出して空dictを返す（分析自体は継続する）。
     """
     try:
-        hist = yf.Ticker(f"{ticker_code}.T").history(period="1y")
+        hist = yf.Ticker(f"{ticker_code}.T", session=_get_yf_session()).history(period="1y")
     except Exception as e:
         print(f"⚠️ テクニカル指標の日足取得に失敗しました（スキップします）: {e}")
         return {}
@@ -108,7 +126,7 @@ def fetch_stock_and_market_data(ticker_code: str):
     対象銘柄データと日経平均(地合い)データを取得する
     """
     symbol = f"{ticker_code}.T"
-    stock = yf.Ticker(symbol)
+    stock = yf.Ticker(symbol, session=_get_yf_session())
     try:
         info = _fetch_info_with_retry(stock)
     except YFRateLimitError:
@@ -135,7 +153,7 @@ def fetch_stock_and_market_data(ticker_code: str):
     # 2. 地合いデータ（日経平均 ^N225 の25日移動平均線チェック）
     market_data = {"nikkei_above_sma25": False, "nikkei_price": 0, "sma25": 0}
     try:
-        n225 = yf.Ticker("^N225")
+        n225 = yf.Ticker("^N225", session=_get_yf_session())
         hist = n225.history(period="3mo")
         if len(hist) >= 25:
             hist['SMA25'] = hist['Close'].rolling(window=25).mean()
@@ -762,7 +780,7 @@ def generate_daily_chart(ticker_code: str, out_path: str) -> bool:
     import mplfinance as mpf
 
     try:
-        hist = yf.Ticker(f"{ticker_code}.T").history(period="6mo")
+        hist = yf.Ticker(f"{ticker_code}.T", session=_get_yf_session()).history(period="6mo")
     except Exception as e:
         print(f"⚠️ 日足データの取得に失敗しました（チャートをスキップします）: {e}")
         return False
