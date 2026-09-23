@@ -1,0 +1,62 @@
+name: Daily Stock Screener & Analysis
+
+on:
+  schedule:
+    # 平日 17:00 JST (= 08:00 UTC)。JST は夏時間がないため固定で問題ない
+    - cron: "0 8 * * 1-5"
+  workflow_dispatch:
+
+# 前回の実行が残っていれば重複起動しない
+concurrency:
+  group: daily-stock-analysis
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Kimi Code CLI の自動アップデート・テレメトリを無効化
+  KIMI_CODE_NO_AUTO_UPDATE: "1"
+  KIMI_DISABLE_TELEMETRY: "1"
+
+jobs:
+  screen-and-analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Kimi Code CLI
+        run: |
+          curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+          echo "$HOME/.kimi-code/bin" >> "$GITHUB_PATH"
+
+      - name: Run stock-screener
+        run: python stock-screener.py
+
+      - name: Upload screener results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pullback_buy_signals
+          path: pullback_buy_signals.csv
+          if-no-files-found: ignore
+
+      - name: Run stock-analyze (STRONG_BUY / BUY)
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # Kimi Platform の API キー認証（config.toml 不要の env ベース認証）
+          KIMI_MODEL_NAME: ${{ vars.KIMI_MODEL_NAME }}
+          KIMI_MODEL_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          MAX_ANALYZE_STOCKS: "30"
+        run: python analyze_signals.py
