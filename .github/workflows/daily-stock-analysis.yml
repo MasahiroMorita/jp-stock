@@ -5,6 +5,18 @@ on:
     # 平日 17:00 JST (= 08:00 UTC)。JST は夏時間がないため固定で問題ない
     - cron: "0 8 * * 1-5"
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "実行モード"
+        type: choice
+        options:
+          - screener-and-analyze
+          - analyze-only
+        default: screener-and-analyze
+      max_stocks:
+        description: "分析する最大銘柄数"
+        type: string
+        default: "30"
 
 # 前回の実行が残っていれば重複起動しない
 concurrency:
@@ -52,11 +64,14 @@ jobs:
           curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
           echo "$HOME/.kimi-code/bin" >> "$GITHUB_PATH"
 
+      # analyze-only モードではスクリーナーをスキップし、リポジトリに登録済みの
+      # テスト用フィクスチャCSV (test/fixtures/pullback_buy_signals.csv) を使って analyze を検証する
       - name: Run stock-screener
+        if: github.event.inputs.run_mode != 'analyze-only'
         run: python stock-screener.py
 
       - name: Upload screener results
-        if: always()
+        if: always() && github.event.inputs.run_mode != 'analyze-only'
         uses: actions/upload-artifact@v4
         with:
           name: pullback_buy_signals
@@ -71,5 +86,7 @@ jobs:
           # Kimi Platform の API キー認証（config.toml 不要の env ベース認証）
           KIMI_MODEL_NAME: ${{ vars.KIMI_MODEL_NAME }}
           KIMI_MODEL_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          MAX_ANALYZE_STOCKS: "30"
+          # analyze-only モードではスクリーナ出力の代わりにフィクスチャCSVを使う
+          SIGNALS_CSV: ${{ github.event.inputs.run_mode == 'analyze-only' && 'test/fixtures/pullback_buy_signals.csv' || 'pullback_buy_signals.csv' }}
+          MAX_ANALYZE_STOCKS: ${{ github.event.inputs.max_stocks || '30' }}
         run: python analyze_signals.py

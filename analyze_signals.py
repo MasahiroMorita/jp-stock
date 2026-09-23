@@ -4,13 +4,16 @@ stock-analyze.py を順次実行するランナー（GitHub Actions 用）。
 
 環境変数:
   MAX_ANALYZE_STOCKS: 1回の実行で分析する最大銘柄数 (デフォルト: 30)
+  SIGNALS_CSV: 銘柄リストCSVのパス (デフォルト: pullback_buy_signals.csv)。
+               スクリーナーを実行せず analyze の動作確認だけ行う場合に
+               テスト用フィクスチャCSVを指定するために使う。
 """
 import csv
 import os
 import subprocess
 import sys
 
-CSV_PATH = "pullback_buy_signals.csv"
+CSV_PATH = os.getenv("SIGNALS_CSV", "pullback_buy_signals.csv")
 TARGET_RATINGS = {"STRONG_BUY", "BUY"}
 MAX_STOCKS = int(os.getenv("MAX_ANALYZE_STOCKS", "30"))
 
