@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """pullback_buy_signals.csv から STRONG_BUY / BUY 銘柄を抽出し、
-stock-analyze.py を順次実行するランナー（GitHub Actions 用）。
+stock-analyze.py を順次実行するランナー。
 
 環境変数:
   MAX_ANALYZE_STOCKS: 1回の実行で分析する最大銘柄数 (デフォルト: 30)

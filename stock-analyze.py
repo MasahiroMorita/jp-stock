@@ -177,7 +177,7 @@ KABUTAN_KESSAN_LIMIT = 3  # 取得する決算速報の最大件数
 KABUTAN_INDUSTRY_RANKING_PAGES = (1, 2, 3)  # 業種別ランキングのページ（全33業種分）
 # 業種別ランキングのキャッシュファイル。取得結果は日付付きで保存し、同日の再実行では
 # Web取得をせずキャッシュを使い回す（ analyze_signals.py が本スクリプトを銘柄数分起動するため、
-# CI上で株探へ大量リクエストが集中して405エラーになる問題への対策）。
+# 株探への大量リクエスト集中を避けるための対策）。
 KABUTAN_INDUSTRY_RANKING_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "kabutan_industry_ranking.json"
 )
