@@ -34,7 +34,9 @@ env:
 
 jobs:
   screen-and-analyze:
-    runs-on: ubuntu-latest
+    # 株探(kabutan.jp)がデータセンターIPをWAFで拒否(405)するため、
+    # 自宅のセルフホストランナー(Raspberry Pi)上で実行する。
+    runs-on: self-hosted
     # Secrets/Variables は "Github Actions" Environment に登録されているため参照必須
     environment: Github Actions
     timeout-minutes: 360
@@ -43,7 +45,7 @@ jobs:
 
       # 株探 業種別ランキングのキャッシュを前回実行分から復元する。
       # ファイル内の日付が当日ならそのまま使い回し、前日分でも株探からの
-      # 取得失敗(405)時のフォールバックとして使われる（actions/cache がジョブ終了時に自動保存）。
+      # 取得失敗時のフォールバックとして使われる（actions/cache がジョブ終了時に自動保存）。
       - name: Cache kabutan industry ranking
         uses: actions/cache@v4
         with:
@@ -63,15 +65,6 @@ jobs:
         run: |
           curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
           echo "$HOME/.kimi-code/bin" >> "$GITHUB_PATH"
-
-      # CIランナーの外部通信をすべて VPN Gate の日本リレー経由にする。
-      # 株探(kabutan.jp)はデータセンターIPをWAFで拒否(HTTP 405)するため、
-      # 日本のISP/家庭用IPから egress されるリレー経由でブロックを回避する。
-      # 注意: このステップ以降、Notion/Kimi の API 通信を含む外部通信はすべて
-      # リレーを通る。リレーがダウンしている場合はスコア順に最大10台まで試行し、
-      # すべて失敗したらジョブを失敗させる。
-      - name: Route all traffic via VPN Gate Japan relay
-        run: sudo bash ci/setup-vpn-gate.sh
 
       # analyze-only モードではスクリーナーをスキップし、リポジトリに登録済みの
       # テスト用フィクスチャCSV (test/fixtures/pullback_buy_signals.csv) を使って analyze を検証する
