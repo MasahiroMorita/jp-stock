@@ -712,7 +712,11 @@ def evaluate_with_kimi_cli(data: dict, market_data: dict, quant_score: int, quan
         cmd += ["--agent-file", agent_file]
     else:
         print(f"⚠️ 分析エージェントファイルが見つかりません: {agent_file}（ツール制限なしで続行します）")
-    if KIMI_CLI_MODEL:
+    # KIMI_MODEL_NAME/API_KEY による env ベース認証では CLI が起動時に一時モデル定義を
+    # 合成するため -m 指定は不要。かつ -m は config.toml の [models] を参照する指定であり、
+    # 付与すると env 合成モデルが解決できず「not configured in config.toml」で失敗する。
+    # よって API キーが env にある場合は -m を付けない。
+    if KIMI_CLI_MODEL and not os.getenv("KIMI_MODEL_API_KEY"):
         cmd += ["-m", _resolve_kimi_cli_model(KIMI_CLI_MODEL)]
 
     try:
