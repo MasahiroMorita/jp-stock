@@ -1154,9 +1154,9 @@ def main():
             print(n['body'] or "（本文の取得に失敗しました）")
         print()
 
-    # 4. Notionへ記録（NO_GOの場合は書き込まない）
-    if ai_result.get("judgement") == "NO_GO":
-        print("⏭️ 判定がNO_GOのため、Notionへの書き込みをスキップします。")
+    # 4. Notionへ記録（GOの場合のみ書き込む）
+    if ai_result.get("judgement") != "GO":
+        print(f"⏭️ 判定が{ai_result.get('judgement')}のため、Notionへの書き込みをスキップします。")
     elif NOTION_API_KEY and NOTION_DATABASE_ID:
         # 4-1. 日足チャート生成（失敗しても記録自体は継続する）
         chart_path = None
