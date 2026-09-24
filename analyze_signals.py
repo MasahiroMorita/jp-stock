@@ -47,8 +47,8 @@ def main() -> int:
         )
         targets = targets[:MAX_STOCKS]
 
-    if not os.getenv("KIMI_MODEL_API_KEY") and not os.getenv("KIMI_CLI_MODEL"):
-        print("⚠️ KIMI_MODEL_API_KEY が未設定です。定性評価は失敗する可能性があります。")
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        print("⚠️ DEEPSEEK_API_KEY が未設定です。定性評価は失敗する可能性があります。")
 
     print(f"=== {len(targets)} 銘柄の分析を開始 ===")
     failures = 0

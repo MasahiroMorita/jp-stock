@@ -18,5 +18,8 @@ share/
 # 株探 業種別ランキングの取得結果キャッシュ（stock-analyze.py 実行時に生成）
 kabutan_industry_ranking.json
 
+# セクター関連検索結果のキャッシュ（stock-analyze.py 実行時に生成）
+sector_trend_search_cache.json
+
 # --- OS / エディタ ---
 .DS_Store

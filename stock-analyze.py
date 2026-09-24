@@ -3,12 +3,10 @@ import os
 import re
 import math
 import json
-import shutil
-import subprocess
 import tempfile
 import time
 from datetime import date, timedelta
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 import yfinance as yf
 from yfinance.exceptions import YFRateLimitError
 from dotenv import load_dotenv
@@ -22,9 +20,11 @@ load_dotenv()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# Kimi Code CLI 経由の設定
-KIMI_CLI = os.getenv("KIMI_CLI", "kimi")  # 実行ファイルパスまたはPATH上のコマンド名
-KIMI_CLI_MODEL = os.getenv("KIMI_CLI_MODEL", "")  # 例: kimi-for-coding / k3（省略時はCLIのデフォルト）
+# DeepSeek API の設定
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")  # deepseek-chat / deepseek-reasoner
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_TIMEOUT = 300  # 推論待ちのタイムアウト（秒）
 
 # 定量スコアがこの値以下の場合は AI による定性評価をスキップする
 AI_EVAL_SKIP_THRESHOLD = 22
@@ -382,6 +382,227 @@ def fetch_kabutan_next_earnings_date(ticker_code: str) -> dict | None:
     }
 
 
+# --- Step 1 補助: セクター関連ニュース検索（kabutan / Yahoo!ファイナンス） ---
+# Yahoo Finance の sector は英語（GICS系: "Industrials" 等）で返るため、
+# 検索クエリ用に日本語の業種キーワードへ変換する。
+_SECTOR_JA_QUERY_TERMS = {
+    "Basic Materials": "素材",
+    "Communication Services": "通信",
+    "Consumer Cyclical": "消費",
+    "Consumer Defensive": "食品",
+    "Energy": "資源",
+    "Financial Services": "金融",
+    "Healthcare": "医薬品",
+    "Industrials": "機械",
+    "Real Estate": "不動産",
+    "Technology": "電気機器",
+    "Utilities": "電力",
+}
+SECTOR_SEARCH_MAX_RESULTS = 3  # 1クエリあたりの取得件数
+SECTOR_SEARCH_QUERIES = (
+    "site:kabutan.jp {sector} セクター",
+    "site:finance.yahoo.co.jp {sector} セクター 騰落率",
+)
+# セクター検索結果のキャッシュファイル。取得結果は日付付きで保存し、同日の再実行では
+# Web取得をせずキャッシュを使い回す（analyze_signals.py が本スクリプトを銘柄数分起動するため、
+# 検索エンジンへのリクエスト集中を避けるための対策）。
+SECTOR_SEARCH_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sector_trend_search_cache.json"
+)
+
+
+def _load_sector_search_cache() -> dict | None:
+    """セクター検索結果のキャッシュファイルを読み込む。存在しない・破損している場合は None。"""
+    try:
+        with open(SECTOR_SEARCH_CACHE_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("sectors"), dict):
+        return None
+    return payload
+
+
+def _save_sector_search_cache(fetched_date: str, sectors: dict[str, list[dict]]) -> None:
+    """セクター検索結果を日付付きでキャッシュファイルに保存する。保存失敗時は警告のみ出して継続する。"""
+    try:
+        with open(SECTOR_SEARCH_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fetched_date": fetched_date, "sectors": sectors}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"⚠️ セクター検索結果のキャッシュ保存に失敗しました（スキップします）: {e}")
+
+
+def _decode_ddg_href(href: str) -> str:
+    """DuckDuckGoのリダイレクトURL(//duckduckgo.com/l/?uddg=...)から実URLを取り出す。"""
+    parsed = urlparse(href)
+    if "duckduckgo.com" not in parsed.netloc:
+        return href
+    return unquote(parse_qs(parsed.query).get("uddg", [href])[0])
+
+
+def _search_sector_news_yahoo(query: str) -> list[dict]:
+    """
+    Yahoo! JAPAN検索で `query` を検索し、kabutan / Yahoo!ファイナンス配下の結果を
+    最大 SECTOR_SEARCH_MAX_RESULTS 件抽出する。失敗時は警告を出して空リストを返す。
+    """
+    try:
+        resp = cffi_requests.get(
+            "https://search.yahoo.co.jp/search",
+            params={"p": query, "ei": "UTF-8"},
+            impersonate="chrome",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as e:
+        print(f"⚠️ Yahoo!検索の実行に失敗しました（スキップします）: {e}")
+        return []
+
+    items = []
+    for card in soup.select("div.sw-CardBase"):
+        a = card.select_one("a.sw-Card__titleInner")
+        title = card.select_one("h3.sw-Card__titleMain")
+        if not a or not a.get("href") or not title:
+            continue
+        url = a["href"]
+        host = urlparse(url).netloc
+        if "kabutan" not in host and "yahoo" not in host:
+            continue  # site:指定が効かない結果や広告等を除外
+        items.append({
+            "source": "kabutan.jp" if "kabutan" in host else "finance.yahoo.co.jp",
+            "title": title.get_text(strip=True),
+            "snippet": "",
+            "url": url,
+        })
+        if len(items) >= SECTOR_SEARCH_MAX_RESULTS:
+            break
+    return items
+
+
+def _search_sector_news_ddg(query: str) -> list[dict]:
+    """
+    DuckDuckGo(html)で `query` を検索し、kabutan / Yahoo!ファイナンス配下の結果を
+    最大 SECTOR_SEARCH_MAX_RESULTS 件抽出する（Yahoo!検索のフォールバック用）。
+    失敗時は警告を出して空リストを返す。
+    """
+    try:
+        resp = cffi_requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            impersonate="chrome",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as e:
+        print(f"⚠️ DuckDuckGo検索の実行に失敗しました（スキップします）: {e}")
+        return []
+
+    if not soup.select("div.result"):
+        print(f"⚠️ DuckDuckGo検索の結果が取得できませんでした（ボット判定等の可能性）: {query}")
+        return []
+
+    items = []
+    for div in soup.select("div.result"):
+        a = div.select_one("a.result__a")
+        snip = div.select_one("a.result__snippet")
+        if not a or not a.get("href"):
+            continue
+        url = _decode_ddg_href(a["href"])
+        host = urlparse(url).netloc
+        if "kabutan" not in host and "yahoo" not in host:
+            continue
+        items.append({
+            "source": "kabutan.jp" if "kabutan" in host else "finance.yahoo.co.jp",
+            "title": a.get_text(strip=True),
+            "snippet": (snip.get_text(strip=True) if snip else "")[:300],
+            "url": url,
+        })
+        if len(items) >= SECTOR_SEARCH_MAX_RESULTS:
+            break
+    return items
+
+
+def _fetch_page_excerpt(url: str, max_chars: int = 400) -> str:
+    """
+    検索結果ページの本文先頭をスニペット代わりに抜粋する（検索エンジンがスニペットを
+    返さない場合の補完）。サイトごとに本文コンテナが異なるため優先度付きで試し、
+    本文が取れない場合は meta description で補完する。失敗時は空文字を返す。
+    """
+    try:
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return ""
+    node = None
+    for sel in ("article div.body", "div#main", "article", "div.body", "main"):
+        node = soup.select_one(sel)
+        if node is not None:
+            break
+    if node is None:
+        node = soup.body or soup
+    lines = [ln.strip() for ln in node.get_text("\n", strip=True).splitlines() if ln.strip()]
+    excerpt = "\n".join(lines)[:max_chars].strip()
+    # 本文が取れなかった場合（JS描画ページ等）は meta description で補完する
+    if len(excerpt) < 40:
+        meta = soup.select_one("meta[name='description']")
+        if meta and meta.get("content"):
+            excerpt = meta["content"].strip()[:max_chars]
+    return excerpt
+
+
+def _search_sector_news(query: str) -> list[dict]:
+    """
+    `query` をYahoo! JAPAN検索（失敗時はDuckDuckGo）で実行し、結果一覧を返す。
+    各結果ページの本文先頭を抜粋してスニペットとして添付する（検索結果ページの
+    スニペットだけでは不足するため）。全滅した場合は空リストを返す。
+    """
+    items = _search_sector_news_yahoo(query)
+    if not items:
+        items = _search_sector_news_ddg(query)
+    if not items:
+        print(f"⚠️ セクター検索の結果が取得できませんでした: {query}")
+        return []
+    for item in items:
+        item["snippet"] = _fetch_page_excerpt(item["url"])
+        time.sleep(1)  # 検索結果ページへの負荷軽減のための待機
+    return items
+
+
+def fetch_sector_trend_search(sector: str) -> list[dict]:
+    """
+    対象セクターの直近動向を kabutan.jp / finance.yahoo.co.jp に site: 絞り込みした
+    Web検索で取得し、タイトル・スニペット・URLのリストを返す。
+    検索に失敗した場合は警告を出して空リストを返す（分析自体は継続する）。
+
+    取得結果は日付付きでキャッシュし、同日中の再実行ではWeb取得せずキャッシュを使い回す。
+    結果が空だった場合はキャッシュせず、別銘柄での再実行時に再取得を試みる。
+    """
+    if not sector or sector == "不明":
+        return []
+    query_term = _SECTOR_JA_QUERY_TERMS.get(sector, sector)
+    today = date.today().isoformat()
+    cache = _load_sector_search_cache()
+    if cache is not None and cache.get("fetched_date") == today:
+        cached = cache.get("sectors", {}).get(sector)
+        if cached:
+            print(f"💾 セクター検索結果はキャッシュから読み込みました（{today} 取得分・{sector}）")
+            return cached
+
+    results = []
+    for query_tpl in SECTOR_SEARCH_QUERIES:
+        results.extend(_search_sector_news(query_tpl.format(sector=query_term)))
+        time.sleep(1)  # 検索エンジンへの負荷軽減のための待機
+
+    if results:
+        # 同日中に別セクターの結果がキャッシュ済みなら、それを保持したまま追記する
+        sectors = cache.get("sectors", {}) if cache is not None and cache.get("fetched_date") == today else {}
+        sectors[sector] = results
+        _save_sector_search_cache(today, sectors)
+    return results
+
+
 # --- Step 1 補助: JPX 投資部門別週次売買動向（海外投資家・個人）取得 ---
 JPX_INVESTOR_TYPE_URL = "https://www.jpx.co.jp/markets/statistics-equities/investor-type/index.html"
 
@@ -516,7 +737,7 @@ def calculate_quantitative_score(data: dict, market_data: dict):
     return score, details
 
 
-# --- Step 3: Kimi による地合い・セクター・決算リスク定性分析 ---
+# --- Step 3: DeepSeek による地合い・セクター・決算リスク定性分析 ---
 def _parse_json_response(raw_text: str) -> dict:
     raw_text = raw_text.strip().replace("```json", "").replace("```", "").strip()
     try:
@@ -532,12 +753,13 @@ def _parse_json_response(raw_text: str) -> dict:
 
 def _build_analysis_prompt(data: dict, market_data: dict, quant_score: int, quant_details: list, context: dict | None = None) -> str:
     """
-    Kimi Code CLI 用の分析プロンプトを組み立てる（CLI経由でWeb検索可能な前提）。
+    DeepSeek API 用の分析プロンプトを組み立てる（Web検索はPython側で事前実行し、結果を埋め込む前提）。
     株探・JPX・yfinance から取得済みのデータがあれば、根拠データとしてプロンプト内に埋め込む。
     """
     context = context or {}
     kessan_news = context.get("kessan_news") or []
     industry_ranking = context.get("industry_ranking") or []
+    sector_news = context.get("sector_news") or []
     technicals = context.get("technicals") or {}
     next_earnings = context.get("next_earnings")
     investor_weekly = context.get("investor_weekly")
@@ -575,6 +797,19 @@ def _build_analysis_prompt(data: dict, market_data: dict, quant_score: int, quan
             "株探(kabutan.jp)の業種別ランキングから取得した全業種の平均株価の増減（前日比%）とPERです。"
             "セクター資金流動の評価には必ず以下を根拠として使用してください。\n\n"
             + "\n".join(lines)
+        )
+
+    sector_news_section = ""
+    if sector_news:
+        entries = "\n\n".join(
+            f"{i}. [{r['source']}] {r['title']}\n{r['url']}\n{r['snippet']}"
+            for i, r in enumerate(sector_news, 1)
+        )
+        sector_news_section = (
+            f"\n【セクター関連Web検索結果（{data['sector']}セクター・取得済みデータ）】\n"
+            "kabutan.jp / finance.yahoo.co.jp を対象に事前検索した直近記事のタイトルと本文抜粋です。"
+            "セクターの直近1〜2週間トレンドの評価には必ず以下を根拠として使用してください。\n\n"
+            + entries
         )
 
     technical_section = ""
@@ -626,31 +861,22 @@ def _build_analysis_prompt(data: dict, market_data: dict, quant_score: int, quan
 - 市場全体地合い状況: {nikkei_tone}
 {kessan_section}
 {industry_section}
+{sector_news_section}
 {technical_section}
 {earnings_section}
 {investor_section}
 
-【使用するWebサイト（取得済みデータで不足の場合の補完のみ）】
-※主要な一次データはすべて上記【取得済みデータ】として埋め込み済みです。利用できるツールはWeb検索のみで、使用は1回までです（ページ本文の取得は不可のため、検索結果のスニペットのみが根拠になります）。検索は対象セクターの1〜2週間トレンドの確認（指示2）にのみ使い、それ以外の判断はすべて取得済みデータのみで行ってください。
-
-株探（Kabutan）
-- URL: https://kabutan.jp/
-- 役割: 業種別ランキング・決算速報は取得済み。検索キーワードの参考情報。
-
-Yahoo!ファイナンス
-- URL: https://finance.yahoo.co.jp/
-- 役割: 33業種別株価指数の週間トレンド確認のための検索キーワード参考。
-
-【Web検索および定性分析指示】
+【定性分析指示】
+※主要な一次データはすべて上記【取得済みデータ】として埋め込み済みです。セクター動向のWeb検索も事前に実行済みで、結果を埋め込んでいます。外部ツールは利用できないため、判断はすべて埋め込み済みデータのみを根拠として行ってください。
 1. **全体地合いの確認**:
-   - 取得済みデータ（日経平均の25日線・RSI14・1ヶ月騰落率、業種別前日比の分布、海外投資家・個人の週次売買動向）のみで、市場全体が「買われすぎ」「中立」「冷え込み（売り優勢）」のどちらかを判断してください（検索は使わないでください）。
+   - 取得済みデータ（日経平均の25日線・RSI14・1ヶ月騰落率、業種別前日比の分布、海外投資家・個人の週次売買動向）のみで、市場全体が「買われすぎ」「中立」「冷え込み（売り優勢）」のどちらかを判断してください。
 2. **セクター資金流動チェック**:
    - 【株探 業種別ランキング】の全業種前日比を最重視し、対象セクターが当日「資金流入（値上がり上位）」か「資金流出（逆風）」かを確認してください。
-   - さらに、【{data['sector']}】セクターの直近1〜2週間のトレンド確認のため、Web検索をちょうど1回だけ行ってください（当日データだけでは週間の資金流動を判別できないため。これが唯一の検索用途です）。ページ本文は取得できないため、検索結果のスニペット記述だけを根拠にしてください。
+   - 【{data['sector']}】セクターの直近1〜2週間のトレンドは、【セクター関連Web検索結果】の記事タイトル・本文抜粋を根拠に判断してください（当日データだけでは週間の資金流動を判別できないため）。検索結果が取得できていない場合は、業種別ランキングの前日比と対象銘柄の直近1ヶ月・3ヶ月騰落率、日経平均の1ヶ月騰落率から推測してください。
    - セクター全体が下降トレンドまたは資金流出局面にある場合、「安値追い（さらなる値下がり）」のリスクが高いか？
 3. **該当銘柄の押し目判定**:
    - 【対象銘柄テクニカル指標】のSMA25/75乖離・RSI14・52週高値からの下落率・直近1/3ヶ月騰落率を根拠に、対象銘柄の下落が「一時的な健全な押し目（全体の地合い悪化に連動した一時的調整）」か「個別材料悪化による本格的な下落トレンド転換」かを判定してください。
-   - 個別材料の有無は【株探 決算速報】の記事と取得済みデータのみで判断してください（検索は使わないでください）。
+   - 個別材料の有無は【株探 決算速報】の記事と取得済みデータのみで判断してください。
 4. **決算イベントリスクの調査**:
    - 上記【株探 決算速報】の取得済み記事があれば、直近業績・会社計画の一次情報として最重視してください。
    - 【次回決算発表予定日（推定）】が14日以内の場合は、推定誤差を考慮した上で減点対象（または「WAIT」判定）としてください。
@@ -671,106 +897,67 @@ Yahoo!ファイナンス
 """
 
 
-def _resolve_kimi_cli_model(model: str) -> str:
+def evaluate_with_deepseek(data: dict, market_data: dict, quant_score: int, quant_details: list, context: dict | None = None):
     """
-    KIMI_CLI_MODEL をCLIのモデルエイリアス名に解決する。
-    エイリアス指定(例: kimi-code/k3)はそのまま、モデルIDのみの指定(例: k3)は
-    config.toml の models に登録されているエイリアス(例: kimi-code/k3)に変換する。
+    DeepSeek API（OpenAI互換のchat/completions）を直接呼び出して定性評価を行う。
+    JSON出力を強制する response_format を指定し、それでもJSONとして解析できない場合は
+    1回だけリトライする（2回目のプロンプトにはJSONのみの出力を強く指示する）。
     """
-    if not model or "/" in model:
-        return model
-    try:
-        import tomllib
-        with open(os.path.expanduser("~/.kimi-code/config.toml"), "rb") as f:
-            aliases = (tomllib.load(f).get("models") or {}).keys()
-        for alias in aliases:
-            if alias.endswith(f"/{model}"):
-                return alias
-    except (OSError, tomllib.TOMLDecodeError):
-        pass
-    return model
-
-
-def evaluate_with_kimi_cli(data: dict, market_data: dict, quant_score: int, quant_details: list, context: dict | None = None):
-    """
-    Kimi Code CLI をサブプロセスで呼び出し、定性評価を行う。
-    分析専用エージェント（.kimi-code/agents/stock-analyst.md）でツールはWeb検索のみに制限され、
-    環境変数 KIMI_LOOP_MAX_STEPS_PER_TURN でエージェントループのステップ数も上限に制限する。
-    """
-    cli = shutil.which(KIMI_CLI)
-    if cli is None:
-        # インストールスクリプトによる既定インストール先のフォールバック（.bashrc未読み込みのシェル用）
-        default_path = os.path.expanduser("~/.kimi-code/bin/kimi")
-        cli = default_path if os.path.isfile(default_path) else KIMI_CLI
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY が設定されていません。.env に DeepSeek のAPIキーを設定してください。"
+        )
     prompt = _build_analysis_prompt(data, market_data, quant_score, quant_details, context)
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    agent_file = os.path.join(script_dir, ".kimi-code", "agents", "stock-analyst.md")
+    url = f"{DEEPSEEK_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "あなたは勝率重視の日本株ファンダメンタル・アナリストです。"
+                    "ユーザーのプロンプトに埋め込まれた【取得済みデータ】のみを根拠に定性評価を行い、"
+                    "プロンプトに指定されたJSONのみを出力してください。"
+                    "前後の説明文やマークダウンのコードブロック装飾は付けないこと。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},  # JSON出力を強制する
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }
 
-    cmd = [cli, "-p", prompt, "--output-format", "stream-json"]
-    if os.path.isfile(agent_file):
-        cmd += ["--agent-file", agent_file]
-    else:
-        print(f"⚠️ 分析エージェントファイルが見つかりません: {agent_file}（ツール制限なしで続行します）")
-    # KIMI_MODEL_NAME/API_KEY による env ベース認証では CLI が起動時に一時モデル定義を
-    # 合成するため -m 指定は不要。かつ -m は config.toml の [models] を参照する指定であり、
-    # 付与すると env 合成モデルが解決できず「not configured in config.toml」で失敗する。
-    # よって API キーが env にある場合は -m を付けない。
-    if KIMI_CLI_MODEL and not os.getenv("KIMI_MODEL_API_KEY"):
-        cmd += ["-m", _resolve_kimi_cli_model(KIMI_CLI_MODEL)]
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            cwd=script_dir,  # プロジェクトの .kimi-code/mcp.json を読むため
-            env={**os.environ, "KIMI_LOOP_MAX_STEPS_PER_TURN": "5"},
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"`{KIMI_CLI}` コマンドが見つかりません。"
-            "Kimi Code CLI をインストールするか、.env の KIMI_CLI に実行ファイルのパスを指定してください。"
-        )
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"kimi CLI エラー (exit {proc.returncode}): {proc.stderr[:500]}")
-
-    # stream-json: stdout の1行1JSON。アシスタントのテキストブロックを抽出し、
-    # 後ろから順にJSON解析を試す（最終メッセージにJSON以外の補足文が付く場合への対応）
-    assistant_texts = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for attempt in (1, 2):
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            assistant_texts.append(content)
-        elif isinstance(content, list):
-            texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            if texts:
-                assistant_texts.append("\n".join(texts))
+            resp = cffi_requests.post(
+                url, headers=headers, json=payload, impersonate="chrome", timeout=DEEPSEEK_TIMEOUT
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"DeepSeek API の呼び出しに失敗しました: {e}")
 
-    if not assistant_texts:
-        raise RuntimeError(
-            f"kimi CLI から有効な応答を取得できませんでした。\nstdout: {proc.stdout[:500]}\nstderr: {proc.stderr[:300]}"
-        )
-    for text in reversed(assistant_texts):
+        obj = resp.json()
+        content = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "")
         try:
-            return _parse_json_response(text)
+            return _parse_json_response(content)
         except json.JSONDecodeError:
-            continue
-    raise RuntimeError(
-        f"kimi CLI の応答からJSONを抽出できませんでした。\n最終メッセージ: {assistant_texts[-1][:500]}\nstderr: {proc.stderr[:300]}"
-    )
+            if attempt == 2:
+                raise RuntimeError(
+                    f"DeepSeek の応答からJSONを抽出できませんでした。\n応答: {content[:500]}"
+                )
+            # 2回目はJSONのみを強制するリトライ
+            payload["messages"].append(
+                {"role": "assistant", "content": content},
+            )
+            payload["messages"].append(
+                {"role": "user", "content": "前回の応答はJSONとして解析できませんでした。指示されたJSONオブジェクトのみを出力してください。"}
+            )
 
 
 # --- Step 4 準備: 日足チャート生成 & Notion への画像アップロード ---
@@ -892,6 +1079,15 @@ def main():
     else:
         print("   業種別ランキングは取得できませんでした。")
 
+    # 1-3b. 対象セクターの関連ニュース検索（kabutan / Yahoo!ファイナンス。失敗しても分析自体は継続する）
+    print("🔎 対象セクターの直近動向をWeb検索しています（kabutan / Yahoo!ファイナンス）...")
+    sector_news = fetch_sector_trend_search(data["sector"])
+    if sector_news:
+        for r in sector_news:
+            print(f"   - [{r['source']}] {r['title']}")
+    else:
+        print("   セクター関連の検索結果は取得できませんでした。")
+
     # 1-4. テクニカル指標・次回決算日（推定）・投資部門別週次データの取得（失敗しても分析自体は継続する）
     print("📉 yfinanceからテクニカル指標を算出しています...")
     technicals = fetch_stock_technicals(ticker)
@@ -926,6 +1122,7 @@ def main():
     context = {
         "kessan_news": kessan_news,
         "industry_ranking": industry_ranking,
+        "sector_news": sector_news,
         "technicals": technicals,
         "next_earnings": next_earnings,
         "investor_weekly": investor_weekly,
@@ -940,8 +1137,8 @@ def main():
             "earnings_risk": "",
         }
     else:
-        print("🤖 Kimi Code CLIで分析中（取得済みデータを優先し、数分かかる場合があります）...")
-        ai_result = evaluate_with_kimi_cli(data, market_data, quant_score, quant_details, context)
+        print("🤖 DeepSeek APIで分析中（取得済みデータを優先し、数分かかる場合があります）...")
+        ai_result = evaluate_with_deepseek(data, market_data, quant_score, quant_details, context)
 
     print("\n--- 最終分析結果 ---")
     print(f"【判定】: {ai_result.get('judgement')}")
