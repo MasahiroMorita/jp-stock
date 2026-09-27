@@ -121,6 +121,32 @@ def fetch_stock_technicals(ticker_code: str) -> dict:
     }
 
 
+def fetch_recent_5day_range(ticker_code: str) -> str | None:
+    """
+    GO判定時に「直近値幅」を算出する: 直近5営業日の高値・安値と現在の株価（直近終値）を
+    取得し、(高値÷現在株価-1)% - (安値÷現在株価-1)% の形式の文字列を返す。
+    データ取得に失敗した場合は警告を出して None を返す（記録自体は継続する）。
+    """
+    try:
+        hist = yf.Ticker(f"{ticker_code}.T", session=_get_yf_session()).history(period="1mo")
+    except Exception as e:
+        print(f"⚠️ 直近値幅の算出に必要な日足データの取得に失敗しました（スキップします）: {e}")
+        return None
+    if hist.empty or len(hist) < 5:
+        print("⚠️ 日足データが不足しているため直近値幅の算出をスキップします。")
+        return None
+
+    window = hist.tail(5)  # 直近5営業日（当日を含む）
+    current = float(window["Close"].iloc[-1])
+    high = float(window["High"].max())
+    low = float(window["Low"].min())
+    if current <= 0:
+        return None
+    high_pct = (high / current - 1) * 100
+    low_pct = (low / current - 1) * 100
+    return f"{high_pct:+.1f}% - {low_pct:+.1f}%"
+
+
 def fetch_stock_and_market_data(ticker_code: str):
     """
     対象銘柄データと日経平均(地合い)データを取得する
@@ -1005,9 +1031,10 @@ def upload_chart_to_notion(notion: Client, png_path: str, filename: str) -> str:
 
 
 # --- Step 4: Notion データベースへの記録（地合い・セクター列を追加） ---
-def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: str | None = None):
+def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: str | None = None, recent_range: str | None = None):
     """
     Notionへ評価結果を保存。chart_path を指定すると日足チャート画像をページ内に添付する。
+    recent_range を指定すると「直近値幅」カラムに記録する（GO判定時のみ）。
     """
     notion = Client(auth=NOTION_API_KEY)
 
@@ -1024,6 +1051,7 @@ def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: 
         "セクター風向き": {"rich_text": [{"text": {"content": ai_result.get("sector_trend", "")}}]},
         "理由・リスク概要": {"rich_text": [{"text": {"content": ai_result.get("reason", "")}}]},
         "決算リスク": {"rich_text": [{"text": {"content": ai_result.get("earnings_risk", "")}}]},
+        "直近値幅": {"rich_text": [{"text": {"content": recent_range or ""}}]},
     }
 
     children = []
@@ -1158,7 +1186,15 @@ def main():
     if ai_result.get("judgement") != "GO":
         print(f"⏭️ 判定が{ai_result.get('judgement')}のため、Notionへの書き込みをスキップします。")
     elif NOTION_API_KEY and NOTION_DATABASE_ID:
-        # 4-1. 日足チャート生成（失敗しても記録自体は継続する）
+        # 4-1. 直近値幅の算出（直近5営業日の高値・安値と現在株価の乖離率。失敗しても記録自体は継続する）
+        print("📐 直近値幅（直近5日高安レンジ）を算出しています...")
+        recent_range = fetch_recent_5day_range(ticker)
+        if recent_range:
+            print(f"   直近値幅: {recent_range}")
+        else:
+            print("   直近値幅は算出できませんでした。")
+
+        # 4-2. 日足チャート生成（失敗しても記録自体は継続する）
         chart_path = None
         tmp_chart = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         tmp_chart.close()
@@ -1166,10 +1202,10 @@ def main():
         if generate_daily_chart(ticker, tmp_chart.name):
             chart_path = tmp_chart.name
 
-        # 4-2. Notionへ書き込み
+        # 4-3. Notionへ書き込み
         print("📝 Notionデータベースへ書き込んでいます...")
         try:
-            record_to_notion(data, quant_score, ai_result, chart_path)
+            record_to_notion(data, quant_score, ai_result, chart_path, recent_range)
         finally:
             if os.path.exists(tmp_chart.name):
                 os.unlink(tmp_chart.name)
