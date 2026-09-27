@@ -144,7 +144,7 @@ def fetch_recent_5day_range(ticker_code: str) -> str | None:
         return None
     high_pct = (high / current - 1) * 100
     low_pct = (low / current - 1) * 100
-    return f"{high_pct:+.1f}% - {low_pct:+.1f}%"
+    return f"{high_pct:+.1f}% 〜 {low_pct:+.1f}%"
 
 
 def fetch_stock_and_market_data(ticker_code: str):
