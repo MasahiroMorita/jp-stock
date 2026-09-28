@@ -158,7 +158,8 @@ def build_updates(props: dict, bar: dict | None, today: date) -> dict | None:
     """
     1ページ分の更新内容を組み立てる。更新が不要な場合は None を返す。
 
-    ケース1: 購入日が本日 & 購入株価が空欄 → 購入株価 = 本日の始値, 購入数 = 1
+    ケース1: 購入日が本日 & 購入株価が空欄 → 購入株価 = 本日の始値,
+             購入数は空欄の場合のみ 1 を記録
     ケース2: 購入日記入済み & 売却日が空欄 → 現在日 = 本日, 現在株価 = 本日の終値,
              現在損益 = (現在株価 - 購入株価) × 購入数
     """
@@ -181,11 +182,15 @@ def build_updates(props: dict, bar: dict | None, today: date) -> dict | None:
         else:
             _warn_if_not_today(ticker, bar, today)
             updates[COL_BUY_PRICE] = {"number": bar["open"]}
-            updates[COL_QTY] = {"number": 1}
             # ケース2の現在損益計算用に値を反映
             buy_price = bar["open"]
-            qty = 1.0
-            print(f"📝 {ticker}: 購入株価={bar['open']}（本日の始値）・購入数=1 を記録します。")
+            if qty is None:
+                # 購入数が空欄の場合のみ 1 を記録する
+                qty = 1.0
+                updates[COL_QTY] = {"number": 1}
+                print(f"📝 {ticker}: 購入株価={bar['open']}（本日の始値）・購入数=1 を記録します。")
+            else:
+                print(f"📝 {ticker}: 購入株価={bar['open']}（本日の始値）を記録します。購入数は既存の値({qty})のまま。")
 
     # ケース2: 購入日記入済み & 売却日が空欄
     if buy_date is not None and sell_date is None:
