@@ -44,8 +44,15 @@ def get_analyst_rating(ticker):
         return None
 
 
-def screen_pullback_stocks(ticker_list, max_stocks=None):
-    """押し目買い（EMA20反発）の条件を満たす銘柄を抽出"""
+def screen_pullback_stocks(ticker_list, max_stocks=None, min_range_pct=3.0):
+    """押し目買い（EMA20反発）の条件を満たす銘柄を抽出
+
+    Args:
+        ticker_list: スクリーニング対象のティッカーリスト
+        max_stocks: 処理する銘柄数の上限（Noneなら全銘柄）
+        min_range_pct: 直近5日間の値幅 (最高値-最安値)/終値 の下限（%）。
+            これ以下の銘柄はレンジが狭すぎるとして除外する。
+    """
     matched_stocks = []
     total = (
         len(ticker_list)
@@ -97,6 +104,20 @@ def screen_pullback_stocks(ticker_list, max_stocks=None):
             )
 
             if is_trend_up and is_pullback_bounce:
+                # 条件C: 直近5日間の値幅 (最高値 - 最安値) / 終値 が
+                # min_range_pct% 以下の銘柄は除外（レンジが狭すぎて動きのない銘柄）
+                last_5_days = df.tail(5)
+                range_5d_pct = (
+                    (last_5_days["High"].max() - last_5_days["Low"].min())
+                    / latest["Close"]
+                ) * 100
+
+                if range_5d_pct <= min_range_pct:
+                    print(
+                        f"  ⏭️  {ticker.replace('.T', '')} をスキップ: 直近5日値幅 {range_5d_pct:.2f}% ({min_range_pct}%以下は除外)"
+                    )
+                    continue
+
                 # アナリスト評価の確認（BUY / STRONG BUY のみ抽出）
                 rating = get_analyst_rating(ticker)
                 if rating not in ("buy", "strong_buy"):
@@ -145,7 +166,8 @@ if __name__ == "__main__":
     ticker_list = get_all_jpx_tickers()
 
     # テスト実行の場合は max_stocks=100 などで動作確認してください
-    result_df = screen_pullback_stocks(ticker_list, max_stocks=None)
+    # 足切り値幅は min_range_pct で変更可（デフォルト: 3%）
+    result_df = screen_pullback_stocks(ticker_list, max_stocks=None, min_range_pct=3.0)
 
     if not result_df.empty:
         print("\n【押し目買い（EMA20反発）シグナル検出銘柄】")
