@@ -6,7 +6,7 @@ NotionのポートフォリオDBを参照し、保有銘柄の株価情報を更
    → 購入株価 = 本日の始値, 購入数 = 1 を書き込む
 2. 購入日が記入済み & 売却日が空欄
    → 現在日 = 本日, 現在株価 = 本日の終値,
-     現在損益 = (現在株価 - 購入株価) × 購入数 を書き込む
+     現在損益 = 現在株価 ÷ 購入株価 - 1 の比率を書き込む（Notionの%表示で±%表記になる）
 3. 更新したページに株価チャート画像（EMA10/20/50・購入日/購入価格のマーカー・
    購入価格+5.5%(TP)/+12%(TP2)/-3.5%(LC)のライン付き）を貼り付ける。
    ページ内に既存の画像ブロックがあれば削除して置き換える。
@@ -177,7 +177,7 @@ def build_updates(props: dict, bar: dict | None, today: date) -> dict | None:
     ケース1: 購入日が本日 & 購入株価が空欄 → 購入株価 = 本日の始値,
              購入数は空欄の場合のみ 1 を記録
     ケース2: 購入日記入済み & 売却日が空欄 → 現在日 = 本日, 現在株価 = 本日の終値,
-             現在損益 = (現在株価 - 購入株価) × 購入数
+             現在損益 = 現在株価 ÷ 購入株価 - 1 の比率（Notion側で%表示）
     """
     ticker = get_rich_text_value(props, COL_TICKER)
     buy_date = get_date_value(props, COL_BUY_DATE)
@@ -216,12 +216,12 @@ def build_updates(props: dict, bar: dict | None, today: date) -> dict | None:
             _warn_if_not_today(ticker, bar, today)
             updates[COL_CURRENT_DATE] = {"date": {"start": today.isoformat()}}
             updates[COL_CURRENT_PRICE] = {"number": bar["close"]}
-            if buy_price is not None and qty is not None:
-                current_pl = round((bar["close"] - buy_price) * qty, 2)
+            if buy_price is not None and buy_price > 0:
+                current_pl = round(bar["close"] / buy_price - 1, 4)
                 updates[COL_CURRENT_PL] = {"number": current_pl}
-                print(f"📈 {ticker}: 現在株価={bar['close']}・現在損益={current_pl} を更新します。")
+                print(f"📈 {ticker}: 現在株価={bar['close']}・現在損益={current_pl:+.2%} を更新します。")
             else:
-                print(f"⚠️ {ticker}: 購入株価または購入数が空のため、現在株価のみ更新します。")
+                print(f"⚠️ {ticker}: 購入株価が空のため、現在株価のみ更新します。")
 
     return updates or None
 
