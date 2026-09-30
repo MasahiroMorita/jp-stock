@@ -8,7 +8,7 @@ NotionのポートフォリオDBを参照し、保有銘柄の株価情報を更
    → 現在日 = 本日, 現在株価 = 本日の終値,
      現在損益 = (現在株価 - 購入株価) × 購入数 を書き込む
 3. 更新したページに株価チャート画像（EMA10/20/50・購入日/購入価格のマーカー・
-   購入価格+5.5%(TP)/-3.5%(LC)のライン付き）を貼り付ける。
+   購入価格+5.5%(TP)/+12%(TP2)/-3.5%(LC)のライン付き）を貼り付ける。
    ページ内に既存の画像ブロックがあれば削除して置き換える。
 
 株価は yfinance から取得する。休日などで本日の日足が無い場合は、
@@ -238,11 +238,14 @@ COLOR_EMA10 = "#2a78d6"      # blue
 COLOR_EMA20 = "#eb6834"      # orange
 COLOR_EMA50 = "#1baf7a"      # aqua
 COLOR_TP = "#0ca30c"         # good（利益確定 +5.5%）
+COLOR_TP2 = "#006300"        # 成功テキスト緑（利益確定2 +12%）
 COLOR_LC = "#d03b3b"         # critical（損切り -3.5%）
 
 TP_PCT = 5.5                 # 利益確定ライン: 購入価格 +5.5%（%表示が基準）
+TP2_PCT = 12.0               # 利益確定ライン2: 購入価格 +12%（%表示が基準）
 LC_PCT = 3.5                 # 損切りライン: 購入価格 -3.5%（%表示が基準）
 TP_RATE = 1 + TP_PCT / 100   # 購入価格からの倍率
+TP2_RATE = 1 + TP2_PCT / 100
 LC_RATE = 1 - LC_PCT / 100   # 購入価格からの倍率
 
 
@@ -254,7 +257,7 @@ def generate_portfolio_chart(
     out_path: str,
 ) -> bool:
     """
-    EMA10/20/50と購入マーカー、TP(+5.5%)/LC(-3.5%)ライン付きの日足チャートをPNGで保存する。
+    EMA10/20/50と購入マーカー、TP(+5.5%)/TP2(+12%)/LC(-3.5%)ライン付きの日足チャートをPNGで保存する。
     購入情報が無い場合はマーカー・ラインなしのチャートになる。
     """
     import matplotlib
@@ -295,8 +298,10 @@ def generate_portfolio_chart(
     title = f"{ticker_code} Daily (EMA10/20/50)"
     if has_buy_info:
         tp = buy_price * TP_RATE
+        tp2 = buy_price * TP2_RATE
         lc = buy_price * LC_RATE
-        title += f" | Buy {buy_price:.1f}  TP {tp:.1f} (+{TP_PCT:.1f}%)  LC {lc:.1f} (-{LC_PCT:.1f}%)"
+        title += (f" | Buy {buy_price:.1f}  TP {tp:.1f} (+{TP_PCT:.1f}%)"
+                  f"  TP2 {tp2:.1f} (+{TP2_PCT:.1f}%)  LC {lc:.1f} (-{LC_PCT:.1f}%)")
 
     fig, axes = mpf.plot(
         hist,
@@ -316,6 +321,7 @@ def generate_portfolio_chart(
         y0, y1 = ax.get_ylim()
         for price, label, color in [
             (tp, f" TP +{TP_PCT:.1f}% ({tp:.1f})", COLOR_TP),
+            (tp2, f" TP2 +{TP2_PCT:.1f}% ({tp2:.1f})", COLOR_TP2),
             (lc, f" LC -{LC_PCT:.1f}% ({lc:.1f})", COLOR_LC),
         ]:
             if y0 <= price <= y1:
