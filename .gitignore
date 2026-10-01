@@ -24,3 +24,6 @@ sector_trend_search_cache.json
 
 # --- OS / エディタ ---
 .DS_Store
+
+# Claude
+.claude/settings.json
