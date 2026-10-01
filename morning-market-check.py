@@ -22,6 +22,8 @@
    - Google News RSS / DuckDuckGo検索（夜間〜朝の市況・地政学ニュース補完）
 4. DeepSeek API に判定プロンプトを投げて最終判定
 5. 判定結果を標準出力し、DISCORD_WEBHOOK_URL が設定されていればDiscordへ通知
+6. 判定結果をNotionの共有DBへ記録（タイトル「YYYY-MM-DD GO/CAUTION/NO GO」・日付・理由/リスク概要。
+   同じ日のレコードが既にあれば上書き更新）
 
 Usage:
   python morning-market-check.py          # 朝8:00〜8:55頃の実行を想定
@@ -44,6 +46,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from curl_cffi import requests as cffi_requests
 from bs4 import BeautifulSoup
+from notion_client import Client
 
 # .envの読み込み
 load_dotenv()
@@ -56,6 +59,10 @@ DEEPSEEK_TIMEOUT = 300  # 推論待ちのタイムアウト（秒）
 
 # Discord通知（任意）。.env に DISCORD_WEBHOOK_URL があれば判定結果を投稿する
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+# Notion記録（任意）。.env に NOTION_API_KEY / NOTION_DATABASE_ID があれば判定結果を共有DBへ記録する
+NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -755,6 +762,66 @@ def notify_discord(text: str) -> bool:
         return False
 
 
+# --- Step 6: Notionへの記録（1日1レコード・同日再実行時は上書き） ---
+NOTION_RICH_TEXT_MAX_CHARS = 1900  # Notion APIの1テキスト上限(2000文字)より少し下で分割する
+
+
+def _notion_rich_text_chunks(text: str) -> list[dict]:
+    """Notion rich_text用にテキストを2000文字制限内のチャンクへ分割する。"""
+    text = text or ""
+    return [{"text": {"content": text[i:i + NOTION_RICH_TEXT_MAX_CHARS]}}
+            for i in range(0, len(text), NOTION_RICH_TEXT_MAX_CHARS)] or [{"text": {"content": ""}}]
+
+
+def record_verdict_to_notion(now: datetime, verdict: str, text: str) -> bool:
+    """
+    判定結果をNotionの共有DBへ記録する（stock-analyze.py と同じDB）。
+    - ページタイトル: 「YYYY-MM-DD GO/CAUTION/NO GO」
+    - 日付: 本日
+    - 理由・リスク概要: 判定結果の全文
+    同じ日のレコードが既にあれば上書き更新し、無ければ新規作成する（cron再実行時の重複防止）。
+    失敗時は警告のみ出して継続する（朝の判定自体は止めない）。
+    """
+    if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        print("⚠️ NOTION_API_KEY / NOTION_DATABASE_ID が未設定のためNotionへの記録をスキップします。")
+        return False
+    try:
+        notion = Client(auth=NOTION_API_KEY)
+
+        # データベースのデータソースIDを取得（新しいNotion APIではクエリにデータソースIDを使う）
+        db = notion.databases.retrieve(NOTION_DATABASE_ID)
+        data_sources = db.get("data_sources") or []
+        if not data_sources:
+            print("⚠️ データベースにデータソースが見つからないためNotionへの記録をスキップします。")
+            return False
+        ds_id = data_sources[0]["id"]
+
+        date_str = now.strftime("%Y-%m-%d")
+        title = f"{date_str} {verdict}"
+        properties = {
+            "ページタイトル": {"title": [{"text": {"content": title}}]},
+            "日付": {"date": {"start": date_str}},
+            "理由・リスク概要": {"rich_text": _notion_rich_text_chunks(text)},
+        }
+
+        # 同じ日のレコードが既にあるか探す（タイトル先頭の日付で判定。銘柄ページは銘柄コード始まりのため混ざらない）
+        res = notion.data_sources.query(
+            ds_id,
+            filter={"property": "ページタイトル", "title": {"starts_with": date_str}},
+        )
+        pages = [r for r in (res.get("results") or []) if r.get("object") == "page"]
+        if pages:
+            notion.pages.update(pages[0]["id"], properties=properties)
+            print("✅ Notionの同日レコードを上書き更新しました。")
+        else:
+            notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=properties)
+            print("✅ Notionへ判定結果を記録しました。")
+        return True
+    except Exception as e:
+        print(f"⚠️ Notionへの記録に失敗しました: {e}")
+        return False
+
+
 # --- メイン実行処理 ---
 def main():
     no_ai = "--no-ai" in sys.argv
@@ -811,6 +878,10 @@ def main():
     # 6. Discord通知（任意・デバッグモードでは通知しない）
     if not no_ai and notify_discord(text):
         print("\n📨 Discordへ通知しました。")
+
+    # 7. Notionへの記録（任意・デバッグモードでは記録しない）
+    if not no_ai:
+        record_verdict_to_notion(now, verdict, text)
 
 
 if __name__ == "__main__":
