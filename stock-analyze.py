@@ -701,6 +701,80 @@ def fetch_jpx_investor_weekly() -> dict | None:
     return {"week": week_label, "prime": prime, "url": xls_url}
 
 
+# --- Step 1 補助: Yahoo!ファイナンス 決算短信の要約（事業概要）取得 ---
+YAHOO_FINANCIALS_SUMMARY_URL = "https://finance.yahoo.co.jp/quote/{ticker}.T/financials"
+# 事業概要として書き込む対象のセクション（見出しの部分一致キーワード → 表示ラベル）
+BUSINESS_OVERVIEW_SECTIONS = (
+    ("事業セグメント", "主な事業セグメント"),
+    ("経営成績", "経営成績の主な変化"),
+    ("業績見通し", "業績見通しの変化"),
+)
+
+
+def fetch_yahoo_financials_summary(ticker_code: str) -> dict | None:
+    """
+    Yahoo!ファイナンスの銘柄ページ(/financials)に掲載されている「決算短信の要約」
+    （生成AI要約）を取得し、タイトル・発表日・セクション別要約・引用元PDFのURLを返す。
+    要約が掲載されていない銘柄や取得に失敗した場合は警告を出して None を返す
+    （分析自体は継続する）。
+    """
+    url = YAHOO_FINANCIALS_SUMMARY_URL.format(ticker=ticker_code)
+    try:
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as e:
+        print(f"⚠️ Yahoo!ファイナンス 決算短信の要約ページの取得に失敗しました（スキップします）: {e}")
+        return None
+
+    article = soup.find("article", id="summary")
+    if article is None:
+        print("⚠️ Yahoo!ファイナンスに決算短信の要約が掲載されていません（スキップします）。")
+        return None
+
+    sections = []
+    for section in article.find_all("section"):
+        heading = section.find("h3")
+        text = section.find("p")
+        if heading is None or text is None:
+            continue
+        heading_text = heading.get_text(" ", strip=True)
+        body_text = text.get_text(" ", strip=True)
+        if not heading_text or not body_text:
+            continue
+        sections.append({"heading": heading_text, "text": body_text})
+    if not sections:
+        print("⚠️ Yahoo!ファイナンスの決算短信の要約からセクションを抽出できませんでした（スキップします）。")
+        return None
+
+    title_el = article.find("h2")
+    date_el = article.select_one("dl time")
+    source_el = article.select_one("a[href$='.pdf']")
+    return {
+        "title": title_el.get_text(" ", strip=True) if title_el else "",
+        "disclosed_at": date_el.get_text(" ", strip=True) if date_el else "",
+        "sections": sections,
+        "source_url": source_el["href"] if source_el else "",
+        "page_url": url,
+    }
+
+
+def extract_business_overview(summary: dict | None) -> list[tuple[str, str]]:
+    """
+    決算短信の要約から事業概要（主な事業セグメント・経営成績の主な変化・
+    業績見通しの変化）をセクション見出しの部分一致で抽出し、
+    (表示ラベル, 本文) のリストで返す。要約が無い場合は空リスト。
+    """
+    if not summary:
+        return []
+    overview = []
+    for keyword, label in BUSINESS_OVERVIEW_SECTIONS:
+        section = next((s for s in summary["sections"] if keyword in s["heading"]), None)
+        if section is not None:
+            overview.append((label, section["text"]))
+    return overview
+
+
 # --- Step 2: 地合い・セクターを含む定量スコア計算 (50点満点) ---
 def calculate_quantitative_score(data: dict, market_data: dict):
     """
@@ -1030,11 +1104,49 @@ def upload_chart_to_notion(notion: Client, png_path: str, filename: str) -> str:
     return upload["id"]
 
 
+def _business_overview_rich_text(summary: dict | None, ticker: str) -> list[dict]:
+    """
+    決算短信の要約から抽出した事業概要を「事業概要」カラム(rich_text)用の
+    テキスト配列として組み立てる。末尾に引用元の決算短信PDFと
+    Yahoo!ファイナンス銘柄ページへのリンクを付ける。
+    抽出できる項目が無い場合は空リストを返す。
+    """
+    overview = extract_business_overview(summary)
+    if not overview:
+        return []
+
+    rich_text = []
+    for i, (label, text) in enumerate(overview):
+        if i:
+            rich_text.append({"type": "text", "text": {"content": "\n"}})
+        rich_text.append({"type": "text", "text": {"content": f"{label}: "}, "annotations": {"bold": True}})
+        # rich_textの文字数上限(2000字)を超えないよう、各セクションは500字までに抑える
+        rich_text.append({"type": "text", "text": {"content": text[:500]}})
+
+    rich_text.append({"type": "text", "text": {"content": "\n出典: "}})
+    source_url = summary.get("source_url") if summary else ""
+    if source_url:
+        source_parts = [p for p in (summary.get("title"), f"発表日 {summary.get('disclosed_at')}") if p]
+        rich_text.append({"type": "text", "text": {"content": "決算短信PDF", "link": {"url": source_url}}})
+        if source_parts:
+            rich_text.append({"type": "text", "text": {"content": f"（{' / '.join(source_parts)}）"}})
+        rich_text.append({"type": "text", "text": {"content": " / "}})
+    rich_text.append({
+        "type": "text",
+        "text": {
+            "content": "Yahoo!ファイナンスの銘柄ページ",
+            "link": {"url": f"https://finance.yahoo.co.jp/quote/{ticker}.T/financials"},
+        },
+    })
+    return rich_text
+
+
 # --- Step 4: Notion データベースへの記録（地合い・セクター列を追加） ---
-def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: str | None = None, recent_range: str | None = None):
+def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: str | None = None, recent_range: str | None = None, yahoo_summary: dict | None = None):
     """
     Notionへ評価結果を保存。chart_path を指定すると日足チャート画像をページ内に添付する。
     recent_range を指定すると「直近値幅」カラムに記録する（GO判定時のみ）。
+    yahoo_summary を指定すると、決算短信の要約から抽出した事業概要を「事業概要」カラムに記載する。
     """
     notion = Client(auth=NOTION_API_KEY)
 
@@ -1052,6 +1164,7 @@ def record_to_notion(data: dict, quant_score: int, ai_result: dict, chart_path: 
         "理由・リスク概要": {"rich_text": [{"text": {"content": ai_result.get("reason", "")}}]},
         "決算リスク": {"rich_text": [{"text": {"content": ai_result.get("earnings_risk", "")}}]},
         "直近値幅": {"rich_text": [{"text": {"content": recent_range or ""}}]},
+        "事業概要": {"rich_text": _business_overview_rich_text(yahoo_summary, data["ticker"]) or [{"text": {"content": ""}}]},
     }
 
     children = []
@@ -1141,6 +1254,14 @@ def main():
     else:
         print("   投資部門別データは取得できませんでした。")
 
+    # 1-5. Yahoo!ファイナンス 決算短信の要約取得（事業概要用。失敗しても分析自体は継続する）
+    print("📄 Yahoo!ファイナンスから決算短信の要約（事業概要）を取得しています...")
+    yahoo_summary = fetch_yahoo_financials_summary(ticker)
+    if yahoo_summary:
+        print(f"   {yahoo_summary['title']}（発表日: {yahoo_summary['disclosed_at']}）")
+    else:
+        print("   決算短信の要約は取得できませんでした。")
+
     # 2. 定量スコア計算
     quant_score, quant_details = calculate_quantitative_score(data, market_data)
     print(f"📈 定量スコア: {quant_score}/50点\n   内訳: {', '.join(quant_details)}")
@@ -1182,6 +1303,14 @@ def main():
             print(n['body'] or "（本文の取得に失敗しました）")
         print()
 
+    if yahoo_summary:
+        overview = extract_business_overview(yahoo_summary)
+        if overview:
+            print("\n--- 事業概要（Yahoo!ファイナンス 決算短信の要約） ---")
+            for label, text in overview:
+                print(f"■ {label}: {text}")
+            print()
+
     # 4. Notionへ記録（GOの場合のみ書き込む）
     if ai_result.get("judgement") != "GO":
         print(f"⏭️ 判定が{ai_result.get('judgement')}のため、Notionへの書き込みをスキップします。")
@@ -1205,7 +1334,7 @@ def main():
         # 4-3. Notionへ書き込み
         print("📝 Notionデータベースへ書き込んでいます...")
         try:
-            record_to_notion(data, quant_score, ai_result, chart_path, recent_range)
+            record_to_notion(data, quant_score, ai_result, chart_path, recent_range, yahoo_summary)
         finally:
             if os.path.exists(tmp_chart.name):
                 os.unlink(tmp_chart.name)
